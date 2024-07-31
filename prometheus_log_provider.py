@@ -1,9 +1,40 @@
 import logging
-import sys
+from opentelemetry import trace
+from opentelemetry.exporter.jaeger.thrift import JaegerExporter
+from opentelemetry.sdk.resources import Resource
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import BatchSpanProcessor
 from prometheus_client import CollectorRegistry, Gauge, Counter, push_to_gateway
+from opentelemetry.trace import set_span_in_context
 from datetime import datetime
 import uuid
-import time
+import sys
+
+# class PrometheusPushgatewayHandler(logging.Handler):
+#     def __init__(self, pushgateway_url, job_name):
+#         super().__init__()
+#         self.pushgateway_url = pushgateway_url
+#         self.job_name = job_name
+#         self.registry = CollectorRegistry()
+#         self.gauge = Gauge('log_message', 'Log message with content', ['unique_id', 'timestamp', 'log_content'], registry=self.registry)
+#         self.error_counter = Counter('promhttp_metric_handler_errors_total', 'Total number of log errors', registry=self.registry)
+#         self.time_taking = Gauge("lambda_processing_time_seconds", 'Description of metric', registry=self.registry)
+#         self.start_time = datetime.utcnow()
+#         self.end_time = datetime.utcnow()
+
+#     def emit(self, record):
+#         log_entry = self.format(record)
+#         timestamp = datetime.utcnow().isoformat()
+#         unique_id = str(uuid.uuid4())
+#         self.gauge.labels(unique_id=unique_id, timestamp=timestamp, log_content=log_entry).set(1)
+#         if record.levelname == 'ERROR':
+#             self.error_counter.inc()
+#         self.end_time = datetime.utcnow()
+#         processing_time = self.end_time - self.start_time
+#         self.time_taking.set(processing_time.total_seconds())
+#         push_to_gateway(self.pushgateway_url, job=self.job_name, registry=self.registry)
+
+
 
 class PrometheusPushgatewayHandler(logging.Handler):
     def __init__(self, pushgateway_url, job_name):
@@ -17,8 +48,41 @@ class PrometheusPushgatewayHandler(logging.Handler):
         self.start_time = datetime.utcnow()
         self.end_time = datetime.utcnow()
 
+        # Initialize Jaeger Tracer
+        self.jaeger_host = "65.0.134.216"
+        self.jaeger_port = 6831
+        self.logger = logging.getLogger()
+        self.logger.setLevel(logging.INFO)
+        self.logger.info(f'Initializing Jaeger Exporter with host: {self.jaeger_host}, port: {self.jaeger_port}')
+        self.jaeger_exporter = JaegerExporter(
+            agent_host_name=self.jaeger_host,
+            agent_port=self.jaeger_port,
+        )
+        self.resource = Resource.create({"service.name": self.job_name})
+        self.provider = TracerProvider(resource=self.resource)
+        trace.set_tracer_provider(self.provider)
+        self.span_processor = BatchSpanProcessor(self.jaeger_exporter)
+        self.provider.add_span_processor(self.span_processor)
+        self.logger.info('Jaeger Exporter initialized successfully')
+
+        # Start a root span for the whole session
+        self.tracer = self.provider.get_tracer(__name__)
+        self.root_span = self.tracer.start_span("log_session")
+        self.root_context = set_span_in_context(self.root_span)
+
+        # Initialize last log entry storage
+        self.last_log_entry = None
+
+        # Track if shutdown has been called
+        self._shutdown_called = False
+
     def emit(self, record):
+        if self._shutdown_called:
+            return
+
         log_entry = self.format(record)
+        self.last_log_entry = log_entry  # Store the current log entry
+
         timestamp = datetime.utcnow().isoformat()
         unique_id = str(uuid.uuid4())
         self.gauge.labels(unique_id=unique_id, timestamp=timestamp, log_content=log_entry).set(1)
@@ -27,41 +91,39 @@ class PrometheusPushgatewayHandler(logging.Handler):
         self.end_time = datetime.utcnow()
         processing_time = self.end_time - self.start_time
         self.time_taking.set(processing_time.total_seconds())
-        push_to_gateway(self.pushgateway_url, job=self.job_name, registry=self.registry)
 
-# # Set up logging
-# logging.basicConfig(level=logging.DEBUG)
-# logger = logging.getLogger(__name__)
+        # Create a span for this log entry within the root context
+        with self.tracer.start_span("log_entry_handler", context=self.root_context) as span:
+            span.set_attribute("log_message", log_entry)  # Set the log entry
+            span.set_attribute("timestamp", timestamp)
+            span.set_attribute("unique_id", unique_id)
 
-# # Set up the handler
-# pushgateway_handler = PrometheusPushgatewayHandler('http://3.6.91.242:9091', 'log_collector')
-# formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-# pushgateway_handler.setFormatter(formatter)
+            # Push metrics to Prometheus Pushgateway
+            push_to_gateway(self.pushgateway_url, job=self.job_name, registry=self.registry)
 
-# # Add the handler to the logger
-# logger.addHandler(pushgateway_handler)
+    def shutdown(self):
+        if not self._shutdown_called:
+            self._shutdown_called = True
+            # End the root span
+            self.root_span.end()
 
-# # Redirect print statements to logger
-# class PrintLogger:
-#     def write(self, message):
-#         if message.strip():  # avoid logging empty lines
-#             logger.info(message.strip())
-#     def flush(self):
-#         pass  # This is a no-op to satisfy the interface
+            # Shutdown Jaeger Tracer and associated components
+            self.provider.shutdown()
 
-# sys.stdout = PrintLogger()
+    def close(self):
+        # Ensure proper cleanup when handler is closed
+        super().close()
+        self.shutdown()
 
-# # Example usage
-# print("This is a print statement that should be logged.")
-# logger.error("This is an error log message")
-# logger.info("This is another info log message")
+    def __del__(self):
+        # Ensure shutdown on object destruction
+        self.shutdown()
 
 
-# import logging
-# from prometheus_client import CollectorRegistry, Gauge, Counter, push_to_gateway
-# from datetime import datetime
-# import uuid
-# import time
+
+
+
+
 
 # class PrometheusPushgatewayHandler(logging.Handler):
 #     def __init__(self, pushgateway_url, job_name):
@@ -71,26 +133,48 @@ class PrometheusPushgatewayHandler(logging.Handler):
 #         self.registry = CollectorRegistry()
 #         self.gauge = Gauge('log_message', 'Log message with content', ['unique_id', 'timestamp', 'log_content'], registry=self.registry)
 #         self.error_counter = Counter('promhttp_metric_handler_errors_total', 'Total number of log errors', registry=self.registry)
-#         self.lambda_processing_gauge = Gauge("lambda_processing_time_seconds", 'Description of metric', registry=self.registry)
-#         self.logs = []
-#         self.start_time = time.time()
+#         self.time_taking = Gauge("lambda_processing_time_seconds", 'Description of metric', registry=self.registry)
+#         self.start_time = datetime.utcnow()
+#         self.end_time = datetime.utcnow()
+
+#         # Initialize Jaeger Tracer
+#         self.jaeger_host = "65.0.134.216"
+#         self.jaeger_port = 6831
+#         self.logger = logging.getLogger()
+#         self.logger.setLevel(logging.INFO)
+#         self.logger.info(f'Initializing Jaeger Exporter with host: {self.jaeger_host}, port: {self.jaeger_port}')
+#         self.jaeger_exporter = JaegerExporter(
+#             agent_host_name=self.jaeger_host,
+#             agent_port=self.jaeger_port,
+#         )
+#         self.resource = Resource.create({"service.name": self.job_name})
+#         self.provider = TracerProvider(resource=self.resource)
+#         trace.set_tracer_provider(self.provider)
+#         self.span_processor = BatchSpanProcessor(self.jaeger_exporter)
+#         self.provider.add_span_processor(self.span_processor)
+#         self.logger.info('Jaeger Exporter initialized successfully')
 
 #     def emit(self, record):
 #         log_entry = self.format(record)
 #         timestamp = datetime.utcnow().isoformat()
 #         unique_id = str(uuid.uuid4())
-#         self.logs.append((unique_id, timestamp, log_entry, record.levelname))
-        
-#     def push_logs(self):
-#         try:
-#             print()
-#         except:
-#             print("Error in push_logs")
-#         for unique_id, timestamp, log_content, levelname in self.logs:
-#             self.gauge.labels(unique_id=unique_id, timestamp=timestamp, log_content=log_content).set(1)
-#             if levelname == 'ERROR':
-#                 self.error_counter.inc()
-#         end_time = time.time()
-#         processing_time = end_time - self.start_time
-#         self.lambda_processing_gauge.set(processing_time)
+#         self.gauge.labels(unique_id=unique_id, timestamp=timestamp, log_content=log_entry).set(1)
+#         if record.levelname == 'ERROR':
+#             self.error_counter.inc()
+#         self.end_time = datetime.utcnow()
+#         processing_time = self.end_time - self.start_time
+#         self.time_taking.set(processing_time.total_seconds())
+
+#         # Start Jaeger span
+#         tracer = self.provider.get_tracer(__name__)
+#         with tracer.start_as_current_span("lambda_handler"):
+#             span = trace.get_current_span()
+#             span.set_attribute("log_message", log_entry)
+#             span.set_attribute("timestamp", timestamp)
+#             span.set_attribute("unique_id", unique_id)
+
+#         # Push metrics to Prometheus Pushgateway
 #         push_to_gateway(self.pushgateway_url, job=self.job_name, registry=self.registry)
+
+#         # Shutdown Jaeger Tracer
+#         self.provider.shutdown()
