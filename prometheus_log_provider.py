@@ -49,7 +49,7 @@ class PrometheusPushgatewayHandler(logging.Handler):
         self.end_time = datetime.utcnow()
 
         # Initialize Jaeger Tracer
-        self.jaeger_host = "65.0.134.216"
+        self.jaeger_host = ""
         self.jaeger_port = 6831
         self.logger = logging.getLogger()
         self.logger.setLevel(logging.INFO)
@@ -138,7 +138,7 @@ class PrometheusPushgatewayHandler(logging.Handler):
 #         self.end_time = datetime.utcnow()
 
 #         # Initialize Jaeger Tracer
-#         self.jaeger_host = "65.0.134.216"
+#         self.jaeger_host = ""
 #         self.jaeger_port = 6831
 #         self.logger = logging.getLogger()
 #         self.logger.setLevel(logging.INFO)
